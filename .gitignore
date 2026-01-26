@@ -1,0 +1,45 @@
+# Binaries
+bin/
+vex
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+coverage.out
+coverage.html
+*.coverprofile
+
+# Dependency directories
+vendor/
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Build artifacts
+dist/
+
+# Debug files
+debug
+*.log
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Air live reload
+tmp/
+
+# Generated files
+*.generated.go

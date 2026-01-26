@@ -1,0 +1,81 @@
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: vex
+    main: ./cmd/vex
+    binary: vex
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X github.com/caesterlein/vex/internal/cli.Version={{.Version}}
+
+archives:
+  - id: vex
+    builds:
+      - vex
+    format: tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        format: zip
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: "checksums.txt"
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+      - "^chore:"
+      - Merge pull request
+      - Merge branch
+
+brews:
+  - name: vex
+    repository:
+      owner: caesterlein
+      name: homebrew-tap
+    directory: Formula
+    homepage: https://github.com/caesterlein/vex
+    description: Unified security scanner for secrets, dependencies, and Dockerfiles
+    license: MIT
+    install: |
+      bin.install "vex"
+    test: |
+      system "#{bin}/vex", "--version"
+
+nfpms:
+  - id: vex
+    package_name: vex
+    vendor: caesterlein
+    homepage: https://github.com/caesterlein/vex
+    description: Unified security scanner for secrets, dependencies, and Dockerfiles
+    license: MIT
+    formats:
+      - deb
+      - rpm
+    bindir: /usr/bin
+
+announce:
+  skip: true
