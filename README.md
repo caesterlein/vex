@@ -9,7 +9,7 @@ A unified security scanner for detecting secrets, vulnerable dependencies, and D
 - **Dockerfile Analysis** - Detect security misconfigurations in container definitions
 - **OpenVEX Support** - Suppress false positives with industry-standard VEX documents
 - **CI Integration** - SARIF output for GitHub Code Scanning and other tools
-- **Monorepo Ready** - Scan multiple projects with per-directory configuration
+- **Per-directory configuration** - Run vex in each project of a monorepo; config is loaded from the scanned path (`.vex.json` / `.vex.yaml`)
 
 ## Installation
 

@@ -6,7 +6,11 @@ import (
 	"context"
 	"io/fs"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
+
+	"golang.org/x/sync/errgroup"
 
 	"github.com/caesterlein/vex/internal/scanner"
 	"github.com/caesterlein/vex/pkg/types"
@@ -14,9 +18,10 @@ import (
 
 // Scanner detects secrets in source code.
 type Scanner struct {
-	patterns         []SecretPattern
-	skipTestFiles    bool
-	additionalIgnore []string
+	patterns      []SecretPattern
+	skipTestFiles bool
+	walkOptions   scanner.WalkOptions
+	workers       int
 }
 
 // Option configures the secret scanner.
@@ -36,11 +41,26 @@ func WithSkipTestFiles(skip bool) Option {
 	}
 }
 
+// WithWalkOptions sets the walk options for file traversal.
+func WithWalkOptions(opts scanner.WalkOptions) Option {
+	return func(s *Scanner) {
+		s.walkOptions = opts
+	}
+}
+
+// WithWorkers sets the number of parallel workers (0 = auto-detect).
+func WithWorkers(n int) Option {
+	return func(s *Scanner) {
+		s.workers = n
+	}
+}
+
 // New creates a new secret scanner.
 func New(opts ...Option) *Scanner {
 	s := &Scanner{
 		patterns:      DefaultPatterns(),
 		skipTestFiles: true,
+		walkOptions:   scanner.DefaultWalkOptions(),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -79,45 +99,95 @@ func (s *Scanner) ShouldScan(path string) bool {
 	return true
 }
 
-// Scan scans a directory for secrets.
+// Scan scans a directory for secrets using parallel workers.
 func (s *Scanner) Scan(ctx context.Context, root string) (*types.ScanResult, error) {
+	// Determine worker count
+	workers := s.workers
+	if workers <= 0 {
+		workers = runtime.NumCPU()
+	}
+
+	// Shared result aggregation with mutex
 	result := &types.ScanResult{
 		Findings: []types.Finding{},
 	}
+	var mu sync.Mutex
 
-	opts := scanner.DefaultWalkOptions()
-	err := scanner.WalkFiles(root, opts, func(path string, info fs.FileInfo) error {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
+	// Create file path channel
+	fileCh := make(chan string, workers*2) // Buffered channel for smoother flow
 
-		if !s.ShouldScan(path) {
-			return nil
-		}
+	g, gctx := errgroup.WithContext(ctx)
 
-		content, err := scanner.ReadFile(path, opts.MaxFileSize)
-		if err != nil || content == nil {
-			return nil
-		}
+	// Producer: walk files and send paths to channel
+	g.Go(func() error {
+		defer close(fileCh)
 
-		if !scanner.IsTextFile(content) {
-			return nil
-		}
-
-		findings, err := s.ScanFile(ctx, path, content)
-		if err != nil {
+		walkOpts := s.walkOptions
+		walkOpts.OnError = func(path string, err error) {
+			mu.Lock()
 			result.Errors = append(result.Errors, err.Error())
-			return nil
+			mu.Unlock()
 		}
 
-		result.Findings = append(result.Findings, findings...)
-		result.ScannedFiles++
-		return nil
+		return scanner.WalkFiles(root, walkOpts, func(path string, info fs.FileInfo) error {
+			select {
+			case <-gctx.Done():
+				return gctx.Err()
+			case fileCh <- path:
+				return nil
+			}
+		})
 	})
 
-	if err != nil {
+	// Workers: process files from channel
+	for i := 0; i < workers; i++ {
+		g.Go(func() error {
+			localFindings := []types.Finding{}
+			localCount := 0
+
+			for path := range fileCh {
+				select {
+				case <-gctx.Done():
+					return gctx.Err()
+				default:
+				}
+
+				if !s.ShouldScan(path) {
+					continue
+				}
+
+				content, err := scanner.ReadFile(path, s.walkOptions.MaxFileSize)
+				if err != nil || content == nil {
+					continue
+				}
+
+				if !scanner.IsTextFile(content) {
+					continue
+				}
+
+				findings, err := s.ScanFile(gctx, path, content)
+				if err != nil {
+					mu.Lock()
+					result.Errors = append(result.Errors, err.Error())
+					mu.Unlock()
+					continue
+				}
+
+				localFindings = append(localFindings, findings...)
+				localCount++
+			}
+
+			// Merge local results once at shutdown
+			mu.Lock()
+			result.Findings = append(result.Findings, localFindings...)
+			result.ScannedFiles += localCount
+			mu.Unlock()
+
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
 		return result, err
 	}
 
@@ -163,16 +233,22 @@ func (s *Scanner) ScanFile(ctx context.Context, path string, content []byte) ([]
 			for _, match := range matches {
 				// Mask the secret in the snippet
 				snippet := line
+				matchStart := match[0]
+				matchEnd := match[1]
+
 				if len(snippet) > 200 {
-					start := match[0] - 50
+					start := matchStart - 50
 					if start < 0 {
 						start = 0
 					}
-					end := match[1] + 50
+					end := matchEnd + 50
 					if end > len(snippet) {
 						end = len(snippet)
 					}
 					snippet = snippet[start:end]
+					// Adjust match indices to be relative to the truncated snippet
+					matchStart -= start
+					matchEnd -= start
 				}
 
 				finding := types.Finding{
@@ -185,9 +261,9 @@ func (s *Scanner) ScanFile(ctx context.Context, path string, content []byte) ([]
 						Path:        relPath,
 						StartLine:   lineNum,
 						EndLine:     lineNum,
-						StartColumn: match[0] + 1,
-						EndColumn:   match[1] + 1,
-						Snippet:     maskSecret(snippet, match[0], match[1]),
+						StartColumn: match[0] + 1, // Original line-relative position
+						EndColumn:   match[1] + 1, // Original line-relative position
+						Snippet:     maskSecret(snippet, matchStart, matchEnd),
 					},
 				}
 				findings = append(findings, finding)
@@ -200,14 +276,19 @@ func (s *Scanner) ScanFile(ctx context.Context, path string, content []byte) ([]
 
 // maskSecret replaces the middle portion of a secret with asterisks.
 func maskSecret(snippet string, start, end int) string {
-	if end <= start || end > len(snippet) {
-		return snippet
+	if end <= start || end > len(snippet) || start < 0 {
+		// On boundary error, return fully masked snippet to avoid leaking secrets
+		return strings.Repeat("*", len(snippet))
 	}
 
 	secretLen := end - start
+	if secretLen <= 4 {
+		// For very short secrets (1-4 chars), mask completely
+		return snippet[:start] + strings.Repeat("*", secretLen) + snippet[end:]
+	}
 	if secretLen <= 8 {
-		// For short secrets, show first 2 and last 2 chars
-		return snippet[:start+2] + "****" + snippet[end-2:]
+		// For short secrets (5-8 chars), show first 2 and last 2 chars
+		return snippet[:start+2] + strings.Repeat("*", secretLen-4) + snippet[end-2:]
 	}
 
 	// Show first 4 and last 4 chars of the secret

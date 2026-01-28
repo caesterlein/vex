@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/caesterlein/vex/internal/config"
 	"github.com/caesterlein/vex/pkg/types"
 )
 
@@ -44,6 +45,15 @@ type WalkOptions struct {
 
 	// IncludeHidden controls whether hidden files are scanned
 	IncludeHidden bool
+
+	// OnError is called when file walk encounters an error.
+	// If nil, errors are silently skipped. Setting this allows
+	// collecting non-fatal errors during traversal.
+	OnError func(path string, err error)
+
+	// OnProgress is called before processing each file.
+	// If nil, no progress updates are reported.
+	OnProgress func(path string)
 }
 
 // DefaultWalkOptions returns sensible defaults for walking.
@@ -67,11 +77,48 @@ func DefaultWalkOptions() WalkOptions {
 	}
 }
 
+// WalkOptionsFromConfig creates WalkOptions from a Config, merging config ignore patterns
+// with default ignore patterns. Duplicates are removed.
+func WalkOptionsFromConfig(cfg *config.Config) WalkOptions {
+	defaultOpts := DefaultWalkOptions()
+	
+	// Create a map to track seen patterns for deduplication
+	seen := make(map[string]bool)
+	merged := make([]string, 0, len(defaultOpts.IgnorePatterns)+len(cfg.Ignore))
+	
+	// Add default patterns first
+	for _, pattern := range defaultOpts.IgnorePatterns {
+		if !seen[pattern] {
+			seen[pattern] = true
+			merged = append(merged, pattern)
+		}
+	}
+	
+	// Add config patterns (avoiding duplicates)
+	for _, pattern := range cfg.Ignore {
+		if !seen[pattern] {
+			seen[pattern] = true
+			merged = append(merged, pattern)
+		}
+	}
+	
+	return WalkOptions{
+		IgnorePatterns: merged,
+		FollowSymlinks: defaultOpts.FollowSymlinks,
+		MaxFileSize:    defaultOpts.MaxFileSize,
+		IncludeHidden:  defaultOpts.IncludeHidden,
+	}
+}
+
 // WalkFiles walks the directory tree and calls fn for each regular file.
 func WalkFiles(root string, opts WalkOptions, fn func(path string, info fs.FileInfo) error) error {
 	return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			return err
+			// Report walk errors via callback instead of aborting
+			if opts.OnError != nil {
+				opts.OnError(path, err)
+			}
+			return nil // Skip this entry, continue walking
 		}
 
 		// Get relative path for pattern matching
@@ -95,12 +142,21 @@ func WalkFiles(root string, opts WalkOptions, fn func(path string, info fs.FileI
 
 		info, err := d.Info()
 		if err != nil {
+			// Report stat errors via callback
+			if opts.OnError != nil {
+				opts.OnError(path, err)
+			}
 			return nil // Skip files we can't stat
 		}
 
 		// Check file size
 		if opts.MaxFileSize > 0 && info.Size() > opts.MaxFileSize {
 			return nil
+		}
+
+		// Report progress if callback is set
+		if opts.OnProgress != nil {
+			opts.OnProgress(path)
 		}
 
 		return fn(path, info)
@@ -116,10 +172,27 @@ func shouldSkip(relPath, name string, isDir bool, opts WalkOptions) bool {
 
 	// Check ignore patterns
 	for _, pattern := range opts.IgnorePatterns {
-		if matched, _ := filepath.Match(pattern, name); matched {
+		matched, err := filepath.Match(pattern, name)
+		if err != nil {
+			// Report malformed pattern errors via callback
+			if opts.OnError != nil {
+				opts.OnError(name, err)
+			}
+			continue
+		}
+		if matched {
 			return true
 		}
-		if matched, _ := filepath.Match(pattern, relPath); matched {
+
+		matched, err = filepath.Match(pattern, relPath)
+		if err != nil {
+			// Report malformed pattern errors via callback
+			if opts.OnError != nil {
+				opts.OnError(relPath, err)
+			}
+			continue
+		}
+		if matched {
 			return true
 		}
 	}

@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/caesterlein/vex/pkg/types"
+	"gopkg.in/yaml.v3"
 )
 
 // Config holds the vex scanner configuration.
@@ -28,6 +30,9 @@ type Config struct {
 
 	// VEX configures VEX document handling
 	VEX VEXConfig `json:"vex" yaml:"vex"`
+
+	// Workers sets the number of parallel workers (0 = auto-detect from CPU count)
+	Workers int `json:"workers" yaml:"workers"`
 }
 
 // ScannersConfig controls scanner behavior.
@@ -153,8 +158,29 @@ func Load(path string) (*Config, error) {
 	}
 
 	config := DefaultConfig()
-	if err := json.Unmarshal(content, config); err != nil {
-		return nil, err
+	
+	// Detect file format by extension
+	ext := strings.ToLower(filepath.Ext(path))
+	isYAML := ext == ".yaml" || ext == ".yml"
+	
+	if isYAML {
+		if err := yaml.Unmarshal(content, config); err != nil {
+			return nil, err
+		}
+	} else if ext == ".json" {
+		if err := json.Unmarshal(content, config); err != nil {
+			return nil, err
+		}
+	} else {
+		// Try JSON first, then YAML as fallback
+		if err := json.Unmarshal(content, config); err != nil {
+			// If JSON fails, try YAML
+			if yamlErr := yaml.Unmarshal(content, config); yamlErr != nil {
+				return nil, err // Return original JSON error
+			}
+			// YAML succeeded, continue
+		}
+		// JSON succeeded, continue
 	}
 
 	return config, nil

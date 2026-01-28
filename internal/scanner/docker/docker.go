@@ -5,20 +5,31 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 
+	"github.com/caesterlein/vex/internal/scanner"
 	"github.com/caesterlein/vex/pkg/types"
 )
 
 // Scanner scans Dockerfiles for security issues.
-type Scanner struct{}
+type Scanner struct {
+	walkOptions scanner.WalkOptions
+}
 
 // New creates a new Docker scanner.
-func New() *Scanner {
-	return &Scanner{}
+// If walkOpts is nil, DefaultWalkOptions() will be used.
+func New(walkOpts ...scanner.WalkOptions) *Scanner {
+	opts := scanner.DefaultWalkOptions()
+	if len(walkOpts) > 0 {
+		opts = walkOpts[0]
+	}
+	return &Scanner{
+		walkOptions: opts,
+	}
 }
 
 // Name returns the scanner name.
@@ -32,17 +43,17 @@ func (s *Scanner) Scan(ctx context.Context, root string) (*types.ScanResult, err
 		Findings: []types.Finding{},
 	}
 
-	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
+	// Configure error callback to collect walk errors
+	walkOpts := s.walkOptions
+	walkOpts.OnError = func(path string, err error) {
+		result.Errors = append(result.Errors, err.Error())
+	}
 
-		if d.IsDir() {
-			name := d.Name()
-			if name == ".git" || name == "node_modules" || name == "vendor" {
-				return filepath.SkipDir
-			}
-			return nil
+	err := scanner.WalkFiles(root, walkOpts, func(path string, info fs.FileInfo) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
 		}
 
 		// Check if this is a Dockerfile

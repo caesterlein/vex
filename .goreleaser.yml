@@ -63,7 +63,7 @@ brews:
     install: |
       bin.install "vex"
     test: |
-      system "#{bin}/vex", "--version"
+      system "#{bin}/vex", "version"
 
 nfpms:
   - id: vex

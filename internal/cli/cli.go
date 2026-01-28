@@ -6,12 +6,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
+	"sort"
 	"time"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/caesterlein/vex/internal/config"
+	"github.com/caesterlein/vex/internal/progress"
 	"github.com/caesterlein/vex/internal/report"
+	"github.com/caesterlein/vex/internal/scanner"
 	"github.com/caesterlein/vex/internal/scanner/deps"
 	"github.com/caesterlein/vex/internal/scanner/docker"
 	"github.com/caesterlein/vex/internal/scanner/secrets"
@@ -31,6 +36,7 @@ type Options struct {
 	NoVEX       bool
 	SARIFOutput string
 	Verbose     bool
+	Workers     int
 }
 
 var opts Options
@@ -60,6 +66,7 @@ in multiple formats including SARIF for CI integration.`,
 	rootCmd.PersistentFlags().BoolVar(&opts.NoVEX, "no-vex", false, "disable VEX suppression")
 	rootCmd.PersistentFlags().StringVar(&opts.SARIFOutput, "sarif", "", "write SARIF output to file")
 	rootCmd.PersistentFlags().BoolVarP(&opts.Verbose, "verbose", "v", false, "verbose output")
+	rootCmd.PersistentFlags().IntVarP(&opts.Workers, "workers", "w", 0, "number of parallel workers (0 = auto-detect)")
 
 	// Add subcommands
 	rootCmd.AddCommand(newVersionCmd())
@@ -125,57 +132,137 @@ func runScan(cmd *cobra.Command, args []string) error {
 	if opts.OutputFormat != "" {
 		cfg.Output.Format = opts.OutputFormat
 	}
+	if opts.Workers != 0 {
+		cfg.Workers = opts.Workers
+	}
+
+	// Create walk options from config
+	walkOpts := scanner.WalkOptionsFromConfig(cfg)
+
+	// Create progress spinner
+	spinner := progress.NewTTYSpinner(os.Stderr)
+
+	// Set up progress callback to update spinner with relative paths
+	walkOpts.OnProgress = func(path string) {
+		if relPath, err := filepath.Rel(scanPath, path); err == nil {
+			spinner.Update(relPath)
+		} else {
+			spinner.Update(path)
+		}
+	}
 
 	ctx := context.Background()
 	startTime := time.Now()
 
-	var results []*types.ScanResult
+	// Run all scanners in parallel
+	spinner.Start("Scanning")
+	defer spinner.Stop()
+
+	g, gctx := errgroup.WithContext(ctx)
+	results := make([]*types.ScanResult, 3) // Pre-allocate for secrets, deps, docker
 
 	// Run secret scanner
 	if cfg.Scanners.Secrets.Enabled {
-		secretScanner := secrets.New(secrets.WithSkipTestFiles(cfg.Scanners.Secrets.SkipTests))
-		result, err := secretScanner.Scan(ctx, scanPath)
-		if err != nil {
-			return fmt.Errorf("secret scan: %w", err)
-		}
-		results = append(results, result)
+		g.Go(func() error {
+			secretScanner := secrets.New(
+				secrets.WithSkipTestFiles(cfg.Scanners.Secrets.SkipTests),
+				secrets.WithWalkOptions(walkOpts),
+				secrets.WithWorkers(cfg.Workers),
+			)
+			result, err := secretScanner.Scan(gctx, scanPath)
+			if err != nil {
+				return fmt.Errorf("secret scan: %w", err)
+			}
+			results[0] = result
+			return nil
+		})
 	}
 
 	// Run dependency scanner
 	if cfg.Scanners.Dependencies.Enabled {
-		depScanner := deps.New()
-		result, err := depScanner.Scan(ctx, scanPath)
-		if err != nil {
-			return fmt.Errorf("dependency scan: %w", err)
-		}
-		results = append(results, result)
+		g.Go(func() error {
+			depScanner := deps.New(walkOpts)
+			result, err := depScanner.Scan(gctx, scanPath)
+			if err != nil {
+				return fmt.Errorf("dependency scan: %w", err)
+			}
+			results[1] = result
+			return nil
+		})
 	}
 
 	// Run Docker scanner
 	if cfg.Scanners.Docker.Enabled {
-		dockerScanner := docker.New()
-		result, err := dockerScanner.Scan(ctx, scanPath)
-		if err != nil {
-			return fmt.Errorf("docker scan: %w", err)
-		}
-		results = append(results, result)
+		g.Go(func() error {
+			dockerScanner := docker.New(walkOpts)
+			result, err := dockerScanner.Scan(gctx, scanPath)
+			if err != nil {
+				return fmt.Errorf("docker scan: %w", err)
+			}
+			results[2] = result
+			return nil
+		})
 	}
+
+	if err := g.Wait(); err != nil {
+		return err
+	}
+
+	spinner.Stop()
+
+	// Filter out nil results
+	var validResults []*types.ScanResult
+	for _, r := range results {
+		if r != nil {
+			validResults = append(validResults, r)
+		}
+	}
+	results = validResults
 
 	// Aggregate results
 	rpt := report.New(results...)
 	rpt.Duration = time.Since(startTime).Milliseconds()
 
+	// Sort findings for deterministic output
+	sort.Slice(rpt.Findings, func(i, j int) bool {
+		if rpt.Findings[i].Location.Path != rpt.Findings[j].Location.Path {
+			return rpt.Findings[i].Location.Path < rpt.Findings[j].Location.Path
+		}
+		return rpt.Findings[i].Location.StartLine < rpt.Findings[j].Location.StartLine
+	})
+
 	// Apply VEX suppressions
 	if cfg.VEX.Enabled && !opts.NoVEX {
-		vexFiles, _ := vex.FindVexFiles(scanPath)
+		vexFiles, err := vex.FindVexFiles(scanPath)
+		if err != nil && opts.Verbose {
+			fmt.Fprintf(os.Stderr, "warning: failed to find VEX files: %v\n", err)
+		}
 		if len(vexFiles) > 0 {
 			var docs []*vex.Document
+			var parseErrors []error
 			for _, f := range vexFiles {
 				doc, err := vex.ParseFile(f)
-				if err == nil {
-					docs = append(docs, doc)
+				if err != nil {
+					parseErrors = append(parseErrors, fmt.Errorf("%s: %w", filepath.Base(f), err))
+					continue
+				}
+				docs = append(docs, doc)
+			}
+
+			// Print warnings for failed VEX files
+			if len(parseErrors) > 0 {
+				if opts.Verbose {
+					for _, parseErr := range parseErrors {
+						fmt.Fprintf(os.Stderr, "warning: failed to parse VEX file: %v\n", parseErr)
+					}
+				}
+				if len(parseErrors) == len(vexFiles) {
+					fmt.Fprintf(os.Stderr, "warning: all %d VEX files failed to parse\n", len(vexFiles))
+				} else if len(parseErrors) > 0 {
+					fmt.Fprintf(os.Stderr, "warning: %d of %d VEX files failed to parse\n", len(parseErrors), len(vexFiles))
 				}
 			}
+
 			if len(docs) > 0 {
 				filter := vex.NewFilter(docs)
 				rpt.Findings = filter.Apply(rpt.Findings)
@@ -236,16 +323,22 @@ func runVexGenerate(cmd *cobra.Command, args []string) error {
 	secretScanner := secrets.New()
 	if result, err := secretScanner.Scan(ctx, scanPath); err == nil {
 		results = append(results, result)
+	} else if opts.Verbose {
+		fmt.Fprintf(os.Stderr, "warning: secret scan failed: %v\n", err)
 	}
 
 	depScanner := deps.New()
 	if result, err := depScanner.Scan(ctx, scanPath); err == nil {
 		results = append(results, result)
+	} else if opts.Verbose {
+		fmt.Fprintf(os.Stderr, "warning: dependency scan failed: %v\n", err)
 	}
 
 	dockerScanner := docker.New()
 	if result, err := dockerScanner.Scan(ctx, scanPath); err == nil {
 		results = append(results, result)
+	} else if opts.Verbose {
+		fmt.Fprintf(os.Stderr, "warning: docker scan failed: %v\n", err)
 	}
 
 	rpt := report.New(results...)
